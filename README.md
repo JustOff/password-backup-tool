@@ -1,5 +1,5 @@
 ## Password Backup Tool
-Export and import passwords saved in Pale Moon browser. Also allows to import from Chromium based browsers running on Windows. To do so just open Import Passwords dialog and paste the path to the password database for the corresponding browser from the list below or manually navigate to the required profile and select "Login Data" file.
+Export and import passwords saved in Pale Moon browser. Also allows to import from Chromium based browsers running on Windows. To do so just open Import Passwords dialog and paste the path to the password database for the corresponding browser from the list below or manually navigate to the required profile and select "Login Data" file. The browser that you importing data from must be closed during the import.
 
 Well known paths to Chromium based browsers passwords database:
 ```"%LOCALAPPDATA%\Chromium\User Data\Default\Login Data"
