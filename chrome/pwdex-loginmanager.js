@@ -19,6 +19,9 @@ XPCOMUtils.defineLazyModuleGetter(this, "Sqlite",
 XPCOMUtils.defineLazyModuleGetter(this, "OSCrypto",
                                   "chrome://pwdbackuptool/content/OSCrypto.jsm");
 
+const loader = Components.classes["@mozilla.org/moz/jssubscript-loader;1"].getService(Components.interfaces.mozIJSSubScriptLoader);
+loader.loadSubScript("chrome://pwdbackuptool/content/forge.min.js");
+
 const AUTH_TYPE = {
   SCHEME_HTML: 0,
   SCHEME_BASIC: 1,
@@ -299,7 +302,7 @@ var passwordExporterLoginMgr = {
             if (fp.show() == fp.returnCancel)
                 return;
 
-            if (fp.file.path.indexOf('.csv') != -1 || fp.file.path.indexOf('.xml') != -1) {
+            if (fp.file.path.indexOf('.csv') != -1 || fp.file.path.indexOf('.xml') != -1 || fp.file.path.indexOf('logins.json') != -1) {
                 stream.init(fp.file, 0x01, parseInt("0444", 8), null);
                 streamIO.init(stream);
                 input = streamIO.read(stream.available());
@@ -346,6 +349,45 @@ var passwordExporterLoginMgr = {
                                   'encrypt': header.getAttribute('encrypt')};
                 var entries = doc.documentElement.getElementsByTagName('entry');
                 this.import('xml', properties, entries);
+            }
+            // Firefox 58+ logins.json
+            else if (fp.file.path.indexOf('logins.json') != -1) {
+                var key4file = fp.file.parent;
+                key4file.append("key4.db");
+                let that = this;
+                this.getRowsFromDBWithoutLocks(key4file.path, "Firefox key4.db",
+                    `SELECT item1,item2,a11 FROM metadata,nssPrivate WHERE metadata.id = 'password' AND nssPrivate.a11 IS NOT NULL LIMIT 1`).then((rows) => {
+                    var masterPasswordBytes = forge.util.encodeUtf8('');
+                    var globalSalt = this.toByteString(rows[0].getResultByName("item1"));
+                    var item2 = this.toByteString(rows[0].getResultByName("item2"));
+                    var item2Asn1 = forge.asn1.fromDer(item2);
+                    var item2Salt = item2Asn1.value[0].value[1].value[0].value;
+                    var item2Data = item2Asn1.value[1].value;
+                    var item2Value = this.decryptKey(globalSalt, masterPasswordBytes, item2Salt, item2Data);
+                    if (item2Value && item2Value.data === 'password-check') {
+                        var a11 = this.toByteString(rows[0].getResultByName("a11"));
+                        var a11Asn1 = forge.asn1.fromDer(a11);
+                        var a11Salt = a11Asn1.value[0].value[1].value[0].value;
+                        var a11Data = a11Asn1.value[1].value;
+                        var a11Value = this.decryptKey(globalSalt, masterPasswordBytes, a11Salt, a11Data);
+                        var key = forge.util.createBuffer(a11Value).getBytes(24);
+                        if (key == null) {
+                            throw new Error('No key found!');
+                        }
+                    } else {
+                        throw new Error('Import data is master password protected!');
+                    }
+                    var jsonData = JSON.parse(input);
+                    var entries = jsonData.logins;
+                    var properties = {'extension': expEngine,
+                                    'importtype': 'saved',
+                                    'importversion': expPwdVer,
+                                    'encrypt': 'false'};
+                    that.import('firefox', properties, entries, key);
+                }).catch(ex => {
+                    alert(ex);
+                    that.finished();
+                });
             // Chrome style Login Data
             } else {
                 let that = this;
@@ -359,7 +401,6 @@ var passwordExporterLoginMgr = {
                                     'encrypt': 'false'};
                     that.import('chrome', properties, rows);
                 }).catch(ex => {
-//                    alert(passwordExporter.getString('passwordexporter.alert-cannot-import'));
                     alert(ex);
                     that.finished();
                 });
@@ -367,7 +408,7 @@ var passwordExporterLoginMgr = {
         },
 
         // Validates import file and parses it
-        import: function (type, properties, entries) {
+        import: function (type, properties, entries, key) {
             // Make sure this is a Password Backup Tool or Password Exporter export file
             if (properties.extension != expEngine && properties.extension != oldEngine) {
                 alert(passwordExporter.getString('passwordexporter.alert-cannot-import'));
@@ -515,6 +556,28 @@ var passwordExporterLoginMgr = {
                         var formattedLogins = this.getFormattedLogin(properties, loginInfo);
                         for each (var login in formattedLogins) {
                             logins.push(login);
+                        }
+                    }
+                }
+                else if (type == 'firefox') {
+                    for (let row of entries) {
+                        try {
+                            var decodedUsername = this.decodeLoginData(row["encryptedUsername"]);
+                            var decodedPassword = this.decodeLoginData(row["encryptedPassword"]);
+                            var username = this.decrypt(decodedUsername.data, decodedUsername.iv, key);
+                            var password = this.decrypt(decodedPassword.data, decodedPassword.iv, key);
+                            var loginInfo = new nsLoginInfo(
+                                row["hostname"],
+                                row["formSubmitURL"],
+                                row["httpRealm"],
+                                username,
+                                password,
+                                row["usernameField"],
+                                row["passwordField"]
+                            );
+                            logins.push(loginInfo);
+                        } catch (e) {
+                            Cu.reportError(e);
                         }
                     }
                 } else {
@@ -828,10 +891,83 @@ var passwordExporterLoginMgr = {
                     }
                 }
                 if (!rows) {
-                    throw new Error("Couldn't get rows from the " + description + " database.");
+                    throw new Error("Couldn't get data from the " + description + " database.");
                 }
                 return rows;
             });
+        },
+
+        decodeLoginData(b64) {
+            var asn1 = forge.asn1.fromDer(forge.util.decode64(b64));
+            return {
+                iv: asn1.value[1].value[1].value,
+                data: asn1.value[2].value
+            };
+        },
+
+        decrypt(data, iv, key) {
+            var decipher = forge.cipher.createDecipher('3DES-CBC', key);
+            decipher.start({ iv: iv });
+            decipher.update(forge.util.createBuffer(data));
+            decipher.finish();
+            return decipher.output;
+        },
+
+        decryptKey(globalSalt, password, entrySalt, data) {
+            var hp = this.sha1(globalSalt + password);
+            var pes = this.toByteString(this.pad(this.toArray(entrySalt), 20).buffer);
+            var chp = this.sha1(hp + entrySalt);
+            var k1 = this.hmac(pes + entrySalt, chp);
+            var tk = this.hmac(pes, chp);
+            var k2 = this.hmac(tk + entrySalt, chp);
+            var k = k1 + k2;
+            var kBuffer = forge.util.createBuffer(k);
+            var otherLength = kBuffer.length() - 32;
+            var key = kBuffer.getBytes(24);
+            kBuffer.getBytes(otherLength);
+            var iv = kBuffer.getBytes(8);
+            return this.decrypt(data, iv, key);
+        },
+
+        pad(arr, length) {
+            if (arr.length >= length) {
+                return arr;
+            }
+            var padAmount = length - arr.length;
+            var padArr = [];
+            for (let i = 0; i < padAmount; i++) {
+                padArr.push(0);
+            }
+
+            var newArr = new Uint8Array(padArr.length + arr.length);
+            newArr.set(padArr, 0);
+            newArr.set(arr, padArr.length);
+            return newArr;
+        },
+
+        sha1(data) {
+            var md = forge.md.sha1.create();
+            md.update(data, 'raw');
+            return md.digest().data;
+        },
+
+        hmac(data, key) {
+            var hmac = forge.hmac.create();
+            hmac.start('sha1', key);
+            hmac.update(data, 'raw');
+            return hmac.digest().data;
+        },
+
+        toByteString(buffer) {
+          return String.fromCharCode.apply(null, new Uint8Array(buffer));
+        },
+
+        toArray(str) {
+            const arr = new Uint8Array(str.length);
+            for (let i = 0; i < str.length; i++) {
+                arr[i] = str.charCodeAt(i);
+            }
+            return arr;
         }
     }
 };
