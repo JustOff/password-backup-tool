@@ -13,14 +13,12 @@ var { classes: Cc, interfaces: Ci, utils: Cu } = Components;
 Cu.import("resource://gre/modules/Task.jsm");
 Cu.import("resource://gre/modules/XPCOMUtils.jsm");
 Cu.import("resource://gre/modules/NetUtil.jsm");
+Cu.import("resource://gre/modules/Services.jsm");
 
 XPCOMUtils.defineLazyModuleGetter(this, "Sqlite",
                                   "resource://gre/modules/Sqlite.jsm");
 XPCOMUtils.defineLazyModuleGetter(this, "OSCrypto",
                                   "chrome://pwdbackuptool/content/OSCrypto.jsm");
-
-const loader = Components.classes["@mozilla.org/moz/jssubscript-loader;1"].getService(Components.interfaces.mozIJSSubScriptLoader);
-loader.loadSubScript("chrome://pwdbackuptool/content/forge.min.js");
 
 const AUTH_TYPE = {
   SCHEME_HTML: 0,
@@ -354,29 +352,15 @@ var passwordExporterLoginMgr = {
             else if (fp.file.path.indexOf('logins.json') != -1) {
                 var key4file = fp.file.parent;
                 key4file.append("key4.db");
+                if (typeof forge !== 'object') {
+                    var loader = Cc["@mozilla.org/moz/jssubscript-loader;1"].getService(Ci.mozIJSSubScriptLoader);
+                    loader.loadSubScript("chrome://pwdbackuptool/content/forge.min.js");
+                    // entry: ['./lib/asn1.js', './lib/sha1.js', './lib/hmac.js', './lib/des.js', './lib/forge.js'],
+                }
                 let that = this;
                 this.getRowsFromDBWithoutLocks(key4file.path, "Firefox key4.db",
                     `SELECT item1,item2,a11 FROM metadata,nssPrivate WHERE metadata.id = 'password' AND nssPrivate.a11 IS NOT NULL LIMIT 1`).then((rows) => {
-                    var masterPasswordBytes = forge.util.encodeUtf8('');
-                    var globalSalt = this.toByteString(rows[0].getResultByName("item1"));
-                    var item2 = this.toByteString(rows[0].getResultByName("item2"));
-                    var item2Asn1 = forge.asn1.fromDer(item2);
-                    var item2Salt = item2Asn1.value[0].value[1].value[0].value;
-                    var item2Data = item2Asn1.value[1].value;
-                    var item2Value = this.decryptKey(globalSalt, masterPasswordBytes, item2Salt, item2Data);
-                    if (item2Value && item2Value.data === 'password-check') {
-                        var a11 = this.toByteString(rows[0].getResultByName("a11"));
-                        var a11Asn1 = forge.asn1.fromDer(a11);
-                        var a11Salt = a11Asn1.value[0].value[1].value[0].value;
-                        var a11Data = a11Asn1.value[1].value;
-                        var a11Value = this.decryptKey(globalSalt, masterPasswordBytes, a11Salt, a11Data);
-                        var key = forge.util.createBuffer(a11Value).getBytes(24);
-                        if (key == null) {
-                            throw new Error('No key found!');
-                        }
-                    } else {
-                        throw new Error('Import data is master password protected!');
-                    }
+                    var key = that.getKey(rows[0]);
                     var jsonData = JSON.parse(input);
                     var entries = jsonData.logins;
                     var properties = {'extension': expEngine,
@@ -895,6 +879,45 @@ var passwordExporterLoginMgr = {
                 }
                 return rows;
             });
+        },
+
+        getKey(row) {
+            var globalSalt = this.toByteString(row.getResultByName("item1"));
+            var item2 = this.toByteString(row.getResultByName("item2"));
+            var item2Asn1 = forge.asn1.fromDer(item2);
+            var item2Salt = item2Asn1.value[0].value[1].value[0].value;
+            var item2Data = item2Asn1.value[1].value;
+            var a11 = this.toByteString(row.getResultByName("a11"));
+            var a11Asn1 = forge.asn1.fromDer(a11);
+            var a11Salt = a11Asn1.value[0].value[1].value[0].value;
+            var a11Data = a11Asn1.value[1].value;
+            var key, masterPasswordBytes;
+            for (var i = 0; i < 2; i++) {
+                if (i == 0) {
+                    masterPasswordBytes = forge.util.encodeUtf8('');
+                } else {
+                    var password = {value: ''}, check = {value: true}; 
+                    Services.prompt.promptPassword(null, 'Password Required', 'Please enter your master password:', password, null, check);
+                    masterPasswordBytes = forge.util.encodeUtf8(password.value);
+                }
+                var item2Value = this.decryptKey(globalSalt, masterPasswordBytes, item2Salt, item2Data);
+                if (item2Value && item2Value.data === 'password-check') {
+                    var a11Value = this.decryptKey(globalSalt, masterPasswordBytes, a11Salt, a11Data);
+                    key = forge.util.createBuffer(a11Value).getBytes(24);
+                    if (key == null) {
+                        throw new Error('No key found!');
+                    } else {
+                        break;
+                    }
+                } else {
+                    if (i == 0) {
+                        continue;
+                    } else {
+                        throw new Error('Master password incorrect!');
+                    }
+                }
+            }
+            return key;
         },
 
         decodeLoginData(b64) {
