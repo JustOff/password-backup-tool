@@ -355,7 +355,8 @@ var passwordExporterLoginMgr = {
                 if (typeof forge !== 'object') {
                     var loader = Cc["@mozilla.org/moz/jssubscript-loader;1"].getService(Ci.mozIJSSubScriptLoader);
                     loader.loadSubScript("chrome://pwdbackuptool/content/forge.min.js");
-                    // entry: ['./lib/asn1.js', './lib/sha1.js', './lib/hmac.js', './lib/des.js', './lib/forge.js'],
+                    // ['./lib/asn1.js', './lib/sha1.js', './lib/sha256.js', './lib/hmac.js',
+                    //  './lib/des.js', './lib/aes.js', './lib/pbkdf2.js', './lib/forge.js']
                 }
                 let that = this;
                 this.getRowsFromDBWithoutLocks(key4file.path, "Firefox key4.db",
@@ -549,8 +550,8 @@ var passwordExporterLoginMgr = {
                         try {
                             var decodedUsername = this.decodeLoginData(row["encryptedUsername"]);
                             var decodedPassword = this.decodeLoginData(row["encryptedPassword"]);
-                            var username = this.decrypt(decodedUsername.data, decodedUsername.iv, key);
-                            var password = this.decrypt(decodedPassword.data, decodedPassword.iv, key);
+                            var username = this.decrypt(decodedUsername.data, decodedUsername.iv, key, '3DES-CBC');
+                            var password = this.decrypt(decodedPassword.data, decodedPassword.iv, key, '3DES-CBC');
                             var loginInfo = new nsLoginInfo(
                                 row["hostname"],
                                 row["formSubmitURL"],
@@ -889,12 +890,8 @@ var passwordExporterLoginMgr = {
             var globalSalt = this.toByteString(row.getResultByName("item1"));
             var item2 = this.toByteString(row.getResultByName("item2"));
             var item2Asn1 = forge.asn1.fromDer(item2);
-            var item2Salt = item2Asn1.value[0].value[1].value[0].value;
-            var item2Data = item2Asn1.value[1].value;
             var a11 = this.toByteString(row.getResultByName("a11"));
             var a11Asn1 = forge.asn1.fromDer(a11);
-            var a11Salt = a11Asn1.value[0].value[1].value[0].value;
-            var a11Data = a11Asn1.value[1].value;
             var key, masterPasswordBytes;
             for (var i = 0; i < 2; i++) {
                 if (i == 0) {
@@ -904,10 +901,9 @@ var passwordExporterLoginMgr = {
                     Services.prompt.promptPassword(null, 'Password Required', 'Please enter your master password:', password, null, check);
                     masterPasswordBytes = forge.util.encodeUtf8(password.value);
                 }
-                var item2Value = this.decryptKey(globalSalt, masterPasswordBytes, item2Salt, item2Data);
+                var item2Value = this.pbesDecrypt(item2Asn1.value, masterPasswordBytes, globalSalt);
                 if (item2Value && item2Value.data === 'password-check') {
-                    var a11Value = this.decryptKey(globalSalt, masterPasswordBytes, a11Salt, a11Data);
-                    key = forge.util.createBuffer(a11Value).getBytes(24);
+                    key = this.pbesDecrypt(a11Asn1.value, masterPasswordBytes, globalSalt);
                     if (key == null) {
                         throw new Error('No key found!');
                     } else {
@@ -932,28 +928,51 @@ var passwordExporterLoginMgr = {
             };
         },
 
-        decrypt(data, iv, key) {
-            var decipher = forge.cipher.createDecipher('3DES-CBC', key);
+        decrypt(data, iv, key, algorithm) {
+            var decipher = forge.cipher.createDecipher(algorithm, key);
             decipher.start({ iv: iv });
             decipher.update(forge.util.createBuffer(data));
             decipher.finish();
             return decipher.output;
         },
 
-        decryptKey(globalSalt, password, entrySalt, data) {
+        pbesDecrypt(decodedItemSeq, password, globalSalt) {
+            // forge.asn1.fromDer() doesn't seem to decode OBJECTIDENTIFIER values properly,
+            // so we determine if we're using PBES or PBES2 by structure.
+            if (decodedItemSeq[0].value[1].value[0].value[1].value != null) {
+                return this.pbes2Decrypt(decodedItemSeq, password, globalSalt);
+            }
+            return this.pbes1Decrypt(decodedItemSeq, password, globalSalt);
+        },
+
+        pbes2Decrypt(decodedItemSeq, password, globalSalt) {
+            var data = decodedItemSeq[1].value;
+            var pbkdf2Seq = decodedItemSeq[0].value[1].value[0].value[1].value;
+            var salt = pbkdf2Seq[0].value;
+            var iterations = pbkdf2Seq[1].value.charCodeAt();
+            // Prepending 0x040e, where 0x04 = octetstring, 0x0e = string length (14)
+            var iv = '' + decodedItemSeq[0].value[1].value[1].value[1].value;
+            var k = this.sha1(globalSalt + password);
+            var key = forge.pkcs5.pbkdf2(k, salt, iterations, 32, forge.md.sha256.create());
+            return this.decrypt(data, iv, key, 'AES-CBC');
+        },
+
+        pbes1Decrypt(decodedItemSeq, password, globalSalt) {
+            var data = decodedItemSeq[1].value;
+            var salt = decodedItemSeq[0].value[1].value[0].value;
             var hp = this.sha1(globalSalt + password);
-            var pes = this.toByteString(this.pad(this.toArray(entrySalt), 20).buffer);
-            var chp = this.sha1(hp + entrySalt);
-            var k1 = this.hmac(pes + entrySalt, chp);
+            var pes = this.toByteString(this.pad(this.toArray(salt), 20).buffer);
+            var chp = this.sha1(hp + salt);
+            var k1 = this.hmac(pes + salt, chp);
             var tk = this.hmac(pes, chp);
-            var k2 = this.hmac(tk + entrySalt, chp);
+            var k2 = this.hmac(tk + salt, chp);
             var k = k1 + k2;
             var kBuffer = forge.util.createBuffer(k);
             var otherLength = kBuffer.length() - 32;
             var key = kBuffer.getBytes(24);
             kBuffer.getBytes(otherLength);
             var iv = kBuffer.getBytes(8);
-            return this.decrypt(data, iv, key);
+            return this.decrypt(data, iv, key, '3DES-CBC');
         },
 
         pad(arr, length) {
@@ -990,7 +1009,7 @@ var passwordExporterLoginMgr = {
         },
 
         toArray(str) {
-            const arr = new Uint8Array(str.length);
+            var arr = new Uint8Array(str.length);
             for (let i = 0; i < str.length; i++) {
                 arr[i] = str.charCodeAt(i);
             }
