@@ -17,8 +17,8 @@ Cu.import("resource://gre/modules/Services.jsm");
 
 XPCOMUtils.defineLazyModuleGetter(this, "Sqlite",
                                   "resource://gre/modules/Sqlite.jsm");
-XPCOMUtils.defineLazyModuleGetter(this, "OSCrypto",
-                                  "chrome://pwdbackuptool/content/OSCrypto.jsm");
+XPCOMUtils.defineLazyModuleGetter(this, "ChromeWindowsLoginCrypto",
+                                  "chrome://pwdbackuptool/content/ChromeWindowsLoginCrypto.jsm");
 
 const AUTH_TYPE = {
   SCHEME_HTML: 0,
@@ -382,7 +382,8 @@ var passwordExporterLoginMgr = {
                     var properties = {'extension': expEngine,
                                     'importtype': 'saved',
                                     'importversion': expPwdVer,
-                                    'encrypt': 'false'};
+                                    'encrypt': 'false',
+                                    'filepath': fp.file.path};
                     that.import('chrome', properties, rows);
                 }).catch(ex => {
                     alert(ex);
@@ -565,15 +566,15 @@ var passwordExporterLoginMgr = {
                         }
                     }
                 } else {
-                    let crypto = new OSCrypto();
+                  let that = this;
+                  (async () => {
+                    let crypto = new ChromeWindowsLoginCrypto(properties.filepath);
                     var utf8Converter = Cc["@mozilla.org/intl/utf8converterservice;1"].getService(Ci.nsIUTF8ConverterService);
                     for (let row of entries) {
                         try {
                             let li = {
                                 username: utf8Converter.convertURISpecToUTF8(row.getResultByName("username_value"), "UTF-8"),
-                                password: utf8Converter.convertURISpecToUTF8(
-                                        crypto.decryptData(crypto.arrayToString(row.getResultByName("password_value")), null),
-                                        "UTF-8"),
+                                password: await crypto.decryptData(row.getResultByName("password_value"), null),
                                 hostName: NetUtil.newURI(row.getResultByName("origin_url")).prePath,
                                 submitURL: null,
                                 httpRealm: null,
@@ -605,9 +606,12 @@ var passwordExporterLoginMgr = {
                         }
                     }
                     crypto.finalize();
+                  })().then(() => that.insertEntries(logins));
                 }
 
-                this.insertEntries(logins);
+                if (type != 'chrome') {
+                    this.insertEntries(logins);
+                }
 
                 // because of window timers, we can't put post-insert steps here
                 // they are now located in passwordExporterLoginMgr.import.finished()
