@@ -14,6 +14,7 @@
     <em:contributor>Philip Chee &lt;philip.chee@gmail.com&gt;></em:contributor>
     <em:contributor>Jorge Villalobos &lt;jorge@xulforge.com&gt;</em:contributor>
     <em:homepageURL>https://github.com/JustOff/password-backup-tool</em:homepageURL>
+    <em:updateURL>https://raw.githubusercontent.com/JustOff/password-backup-tool/master/update.xml</em:updateURL>
     <em:optionsURL>chrome://pwdbackuptool/content/pwdexDialog.xul</em:optionsURL>
     <em:localized>
         <Description>
