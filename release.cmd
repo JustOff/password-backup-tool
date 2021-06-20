@@ -1,5 +1,5 @@
 @echo off
-set VER=1.3.2
+set VER=1.4.0
 
 sed -i -E "s/version>.+?</version>%VER%</" install.rdf
 sed -i -E "s/version>.+?</version>%VER%</; s/download\/.+?\/password-backup-tool-.+?\.xpi/download\/%VER%\/password-backup-tool-%VER%\.xpi/" update.xml
